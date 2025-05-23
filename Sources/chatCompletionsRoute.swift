@@ -8,9 +8,38 @@ import Hub
 import Tokenizers
 import CoreImage
 
+private struct ChatProcessingError: AbortError {
+    var status: HTTPResponseStatus
+    var reason: String
+    var identifier: String?
+
+    init(status: HTTPResponseStatus, reason: String, modelName: String? = nil, underlyingError: Error? = nil) {
+        self.status = status
+        var fullReason = reason
+        if let modelName = modelName, !modelName.isEmpty {
+            fullReason += " (Model: \(modelName))"
+        }
+        if let underlyingError = underlyingError {
+            fullReason += ". Underlying error: \(underlyingError.localizedDescription)"
+        }
+        self.reason = fullReason
+        self.identifier = modelName
+    }
+}
+
+
+private struct MessageProcessingKeys {
+    static let role = "role"
+    static let content = "content"
+    static let type = "type"
+    static let text = "text"
+    static let imageType = "image"
+    static let videoType = "video"
+}
+
 private func _processTextOnlyMessages(_ chatRequest: ChatCompletionRequest) -> UserInput {
     let messages: [[String: Any]] = chatRequest.messages.map {
-        ["role": $0.role, "content": $0.content.asString ?? ""]
+        [MessageProcessingKeys.role: $0.role, MessageProcessingKeys.content: $0.content.asString ?? ""]
     }
     return UserInput(messages: messages)
 }
@@ -22,11 +51,11 @@ private func _processVLMMessages(_ chatRequest: ChatCompletionRequest) -> UserIn
     let processedMessages: [[String: Any]] = chatRequest.messages.map { message -> [String: Any] in
         switch message.content {
         case .text(let textContent):
-            return ["role": message.role, "content": textContent]
+            return [MessageProcessingKeys.role: message.role, MessageProcessingKeys.content: textContent]
 
         case .fragments(let fragments):
-            let imageFragments = fragments.filter { $0.type == "image" }
-            let videoFragments = fragments.filter { $0.type == "video" }
+            let imageFragments = fragments.filter { $0.type == MessageProcessingKeys.imageType }
+            let videoFragments = fragments.filter { $0.type == MessageProcessingKeys.videoType }
 
             let images = imageFragments.compactMap { fragment in
                 fragment.imageUrl.map { UserInput.Image.url($0) }
@@ -42,21 +71,21 @@ private func _processVLMMessages(_ chatRequest: ChatCompletionRequest) -> UserIn
                 var contentFragments: [[String: Any]] = []
 
                 fragments.forEach { fragment in
-                    if fragment.type == "text", let text = fragment.text {
-                        contentFragments.append(["type": "text", "text": text])
+                    if fragment.type == MessageProcessingKeys.text, let text = fragment.text {
+                        contentFragments.append([MessageProcessingKeys.type: MessageProcessingKeys.text, MessageProcessingKeys.text: text])
                     }
                 }
 
-                contentFragments.append(contentsOf: imageFragments.map { _ in ["type": "image"] })
-                contentFragments.append(contentsOf: videoFragments.map { _ in ["type": "video"] })
+                contentFragments.append(contentsOf: imageFragments.map { _ in [MessageProcessingKeys.type: MessageProcessingKeys.imageType] })
+                contentFragments.append(contentsOf: videoFragments.map { _ in [MessageProcessingKeys.type: MessageProcessingKeys.videoType] })
 
-                return ["role": message.role, "content": contentFragments]
+                return [MessageProcessingKeys.role: message.role, MessageProcessingKeys.content: contentFragments]
             } else {
-                return ["role": message.role, "content": message.content.asString ?? ""]
+                return [MessageProcessingKeys.role: message.role, MessageProcessingKeys.content: message.content.asString ?? ""]
             }
 
         case .none:
-            return ["role": message.role, "content": ""]
+            return [MessageProcessingKeys.role: message.role, MessageProcessingKeys.content: ""]
         }
     }
 
@@ -180,7 +209,7 @@ func registerChatCompletionsRoute(
         let reqModelId = chatRequest.model
         let (modelContainer, tokenizer, loadedModelName) = try await modelProvider.getModel(requestedModelId: reqModelId)
         guard let eosTokenId = tokenizer.eosTokenId else {
-             throw Abort(.internalServerError, reason: "Tokenizer EOS token ID missing for model \(loadedModelName).")
+             throw ChatProcessingError(status: .internalServerError, reason: "Tokenizer EOS token ID missing", modelName: loadedModelName)
         }
 
         let userInput = _processUserMessages(chatRequest, isVLM: isVLM)
@@ -239,10 +268,7 @@ func registerChatCompletionsRoute(
     }
 }
 
-// MARK: - Response Handlers
-
 private func handleStreamingChatResponse(
-    // chatManager: ChatCompletionManager, // Removed
     modelContainer: ModelContainer,
     tokenizer: Tokenizer,
     eosTokenId: Int,
@@ -256,7 +282,7 @@ private func handleStreamingChatResponse(
     stopIdSequences: [[Int]],
     detokenizer: NaiveStreamingDetokenizer,
     estimatedPromptTokens: Int,
-    logger: Logger // Kept for logging and passing to _generateChatTokenStream
+    logger: Logger
 ) async throws -> Response {
     let headers =  HTTPHeaders([
         ("Content-Type", "text/event-stream"),
@@ -285,7 +311,7 @@ private func handleStreamingChatResponse(
                     try await writer.write(.buffer(.init(string: initialSse)))
                 }
 
-                let tokenStream = try await _generateChatTokenStream( // Use standalone function
+                let tokenStream = try await _generateChatTokenStream(
                     modelContainer: modelContainer,
                     tokenizer: tokenizer,
                     eosTokenId: eosTokenId,
@@ -295,7 +321,7 @@ private func handleStreamingChatResponse(
                     topP: topP,
                     repetitionPenalty: repetitionPenalty,
                     repetitionContextSize: repetitionContextSize,
-                    logger: logger // Pass logger
+                    logger: logger
                 )
 
                 for try await token in tokenStream {
@@ -337,7 +363,7 @@ private func handleStreamingChatResponse(
 
             } catch {
                 logger.error("Chat stream error (ID: \(chatId)): \(error)")
-                finalFinishReason = "error" // You might want to send an error event in SSE
+                finalFinishReason = "error"
             }
 
             await writer.write(.buffer(.init(string: AppConstants.sseDoneMessage)))
@@ -350,7 +376,6 @@ private func handleStreamingChatResponse(
 
 private func handleNonStreamingChatResponse(
     req: Request,
-    // chatManager: ChatCompletionManager, // Removed
     modelContainer: ModelContainer,
     tokenizer: Tokenizer,
     eosTokenId: Int,
@@ -363,7 +388,7 @@ private func handleNonStreamingChatResponse(
     repetitionContextSize: Int,
     stopIdSequences: [[Int]],
     estimatedPromptTokens: Int,
-    logger: Logger // Kept for logging and passing to _generateChatTokenStream
+    logger: Logger
 ) async throws -> Response {
     var generatedTokens: [Int] = []
     generatedTokens.reserveCapacity(maxTokens)
@@ -373,7 +398,7 @@ private func handleNonStreamingChatResponse(
 
     do {
         logger.info("Starting non-streaming CHAT generation (ID: \(responseId)) for model \(loadedModelName)")
-        let tokenStream = try await _generateChatTokenStream( // Use standalone function
+        let tokenStream = try await _generateChatTokenStream(
             modelContainer: modelContainer,
             tokenizer: tokenizer,
             eosTokenId: eosTokenId,
@@ -383,7 +408,7 @@ private func handleNonStreamingChatResponse(
             topP: topP,
             repetitionPenalty: repetitionPenalty,
             repetitionContextSize: repetitionContextSize,
-            logger: logger // Pass logger
+            logger: logger
         )
 
         for try await token in tokenStream {
@@ -399,15 +424,15 @@ private func handleNonStreamingChatResponse(
             }
         }
 
-        if finalFinishReason != "stop" { // If loop finished without hitting a stop condition (e.g. maxTokens)
+        if finalFinishReason != "stop" {
             finalFinishReason = (generatedTokens.count >= maxTokens) ? "length" : "stop"
         }
     } catch {
         logger.error("Non-streaming chat generation error (ID: \(responseId)): \(error)")
-        throw Abort(.internalServerError, reason: "Failed to generate chat completion: \(error.localizedDescription)")
+        throw ChatProcessingError(status: .internalServerError, reason: "Failed to generate chat completion", underlyingError: error)
     }
 
-    let completionText = _decodeTokens(generatedTokens, tokenizer: tokenizer) // Use standalone function
+    let completionText = _decodeTokens(generatedTokens, tokenizer: tokenizer)
     let assistantMessage = ChatMessageResponseData(role: "assistant", content: completionText)
     let chatChoice = ChatCompletionChoice(index: 0, message: assistantMessage, finishReason: finalFinishReason)
     let usage = CompletionUsage(

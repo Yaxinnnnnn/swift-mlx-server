@@ -6,6 +6,25 @@ import MLXLMCommon
 import Tokenizers
 import Vapor
 
+private struct TextCompletionError: AbortError {
+    var status: HTTPResponseStatus
+    var reason: String
+    var identifier: String?
+
+    init(status: HTTPResponseStatus, reason: String, modelName: String? = nil, underlyingError: Error? = nil) {
+        self.status = status
+        var fullReason = reason
+        if let modelName = modelName, !modelName.isEmpty {
+            fullReason += " (Model: \(modelName))"
+        }
+        if let underlyingError = underlyingError {
+            fullReason += ". Underlying error: \(underlyingError.localizedDescription)"
+        }
+        self.reason = fullReason
+        self.identifier = modelName
+    }
+}
+
 func registerTextCompletionsRoute(
   _ app: Application,
   modelProvider: ModelProvider
@@ -63,17 +82,16 @@ func registerTextCompletionsRoute(
     let completionRequest = try req.content.decode(CompletionRequest.self)
     let logger = req.logger
     let reqModelName = completionRequest.model
+    let baseCompletionId = "cmpl-\(UUID().uuidString)"
 
     let (modelContainer, tokenizer, loadedModelName) = try await modelProvider.getModel(
       requestedModelId: reqModelName)
     guard let eosTokenId = tokenizer.eosTokenId else {
-      throw Abort(
-        .internalServerError, reason: "Tokenizer EOS token ID missing for model \(loadedModelName)."
-      )
+      throw TextCompletionError(status: .internalServerError, reason: "Tokenizer EOS token ID missing", modelName: loadedModelName)
     }
     let promptTokens = tokenizer.encode(text: completionRequest.prompt)
     logger.info(
-      "Received TEXT completion request for model '\(reqModelName)', prompt tokens: \(promptTokens.count)"
+      "Received TEXT completion request (ID: \(baseCompletionId)) for model '\(reqModelName ?? "default")', prompt tokens: \(promptTokens.count)"
     )
 
     let maxTokens = completionRequest.maxTokens ?? GenerationDefaults.maxTokens
@@ -91,16 +109,20 @@ func registerTextCompletionsRoute(
 
     var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
     if streamResponse {
-      let headers = HTTPHeaders([ /* ... */])
+      let headers = HTTPHeaders([
+        ("Content-Type", "text/event-stream"),
+        ("Cache-Control", "no-cache"),
+        ("Connection", "keep-alive"),
+      ])
       let response = Response(status: .ok, headers: headers)
       response.body = .init(stream: { writer in
         Task {
-          let completionId = "cmpl-\(UUID().uuidString)"
+          let streamCompletionId = baseCompletionId
           var generatedTokens: [Int] = []
           var finalFinishReason: String? = nil
           do {
             logger.info(
-              "Starting TEXT stream generation (ID: \(completionId)) for model \(loadedModelName)")
+              "Starting TEXT stream generation (ID: \(streamCompletionId)) for model \(loadedModelName)")
             let tokenStream = try await generateCompletionTokenStream(
               modelContainer: modelContainer,
               tokenizer: tokenizer,
@@ -122,7 +144,7 @@ func registerTextCompletionsRoute(
 
               if let newTextChunk = detokenizer.next() {
                 let chunkResponse = CompletionChunkResponse(
-                  completionId: completionId, requestedModel: loadedModelName,
+                  completionId: baseCompletionId, requestedModel: loadedModelName,
                   nextChunk: newTextChunk)
                 if let sseString = encodeSSE(response: chunkResponse, logger: logger) {
                   try await writer.write(.buffer(.init(string: sseString)))
@@ -132,17 +154,18 @@ func registerTextCompletionsRoute(
             if finalFinishReason == nil {
               finalFinishReason = (generatedTokens.count >= maxTokens) ? "length" : "stop"
             }
-          } catch { logger.error("Text stream error (ID: \(completionId)): \(error)") }
+          } catch { logger.error("Text stream error (ID: \(streamCompletionId)): \(error)") }
           await writer.write(.buffer(.init(string: AppConstants.sseDoneMessage)))
           await writer.write(.end)
         }
       })
       return response
     } else {
+      let nonStreamCompletionId = baseCompletionId
       var generatedTokens: [Int] = []
       var finalFinishReason = "stop"
       do {
-        logger.info("Starting non-streaming TEXT generation for model \(loadedModelName).")
+        logger.info("Starting non-streaming TEXT generation (ID: \(nonStreamCompletionId)) for model \(loadedModelName).")
         let tokenStream = try await generateCompletionTokenStream(
           modelContainer: modelContainer,
           tokenizer: tokenizer,
@@ -167,10 +190,8 @@ func registerTextCompletionsRoute(
           finalFinishReason = (generatedTokens.count >= maxTokens) ? "length" : "stop"
         }
       } catch {
-        logger.error("Non-streaming text generation error: \(error)")
-        throw Abort(
-          .internalServerError,
-          reason: "Failed to generate completion: \(error.localizedDescription)")
+        logger.error("Non-streaming text generation error (ID: \(nonStreamCompletionId)): \(error)")
+        throw TextCompletionError(status: .internalServerError, reason: "Failed to generate completion", underlyingError: error)
       }
       let completionText = tokenizer.decode(tokens: generatedTokens)
       let choice = CompletionChoice(text: completionText, finishReason: finalFinishReason)
@@ -178,6 +199,7 @@ func registerTextCompletionsRoute(
         promptTokens: promptTokens.count, completionTokens: generatedTokens.count,
         totalTokens: promptTokens.count + generatedTokens.count)
       let completionResponse = CompletionResponse(
+        id: nonStreamCompletionId,
         model: loadedModelName, choices: [choice], usage: usage)
       return try await completionResponse.encodeResponse(for: req)
     }
