@@ -24,6 +24,7 @@ jobs:
 
       - name: Build
         run: |
+          swift package update
           xcodebuild build -scheme swift-mlx-server -configuration Release -destination 'platform=macOS' -derivedDataPath ./dist -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES
 
       - name: Rename and Prepare Artifacts
