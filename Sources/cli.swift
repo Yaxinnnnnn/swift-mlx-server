@@ -61,7 +61,7 @@ func routes(
 @main
 struct MLXServer: AsyncParsableCommand {
   @ArgumentParser.Option(name: .long, help: "Required: Path to MLX model dir/name.")
-  var model: String
+  var model: String?
 
   @ArgumentParser.Option(name: .long, help: "Host address.")
   var host: String = AppConstants.defaultHost
@@ -93,15 +93,15 @@ struct MLXServer: AsyncParsableCommand {
       logger: app.logger
     )
 
-    app.logger.info("Attempting to pre-load default model: \(model)")
-    do {
-      _ = try await modelProvider.getModel(requestedModelId: nil)
-      app.logger.info("Default model pre-loaded successfully.")
-    } catch {
-      app.logger.error(
-        "Failed to pre-load default model \(model): \(error). Server will attempt to load on first request."
-      )
-    }
+    // app.logger.info("Attempting to pre-load default model: \(model)")
+    // do {
+    //   _ = try await modelProvider.getModel(requestedModelId: nil)
+    //   app.logger.info("Default model pre-loaded successfully.")
+    // } catch {
+    //   app.logger.error(
+    //     "Failed to pre-load default model \(model): \(error). Server will attempt to load on first request."
+    //   )
+    // }
     let corsConfiguration = CORSMiddleware.Configuration(
       allowedOrigin: .all,
       allowedMethods: [.GET, .POST, .OPTIONS],

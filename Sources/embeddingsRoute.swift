@@ -187,7 +187,7 @@ func registerEmbeddingsRoute(_ app: Application, embeddingModelProvider: Embeddi
                 logger.trace("Finished processing batch \(batchStart/batchSize + 1) for \(embeddingReqId). Total embeddings so far: \(index)")
             }
             let usage = UsageData(prompt_tokens: promptTokens, total_tokens: promptTokens)
-            logger.info("Embedding generation complete (ID: \(embeddingReqId)) for model \(loadedModelName). Total tokens: \(promptTokens)")
+            logger.info("Embedding generation complete (ID: \(embeddingReqId), peakMemory: \(MLX.GPU.peakMemory / (1024*1024)) MB) for model \(loadedModelName). Total tokens: \(promptTokens)")
 
             return EmbeddingResponse(data: allData, model: loadedModelName, usage: usage)
 

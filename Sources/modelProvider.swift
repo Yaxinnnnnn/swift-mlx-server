@@ -40,8 +40,8 @@ actor ModelProvider {
     private let fileManager = FileManager.default
     private let modelDownloadBaseURL: URL
 
-    init(defaultModelPath: String, isVLM: Bool, logger: Logger) {
-        self.defaultModelPath = defaultModelPath
+    init(defaultModelPath: String?, isVLM: Bool, logger: Logger) {
+        self.defaultModelPath = defaultModelPath ?? ""
         self.modelFactory = isVLM ? VLMModelFactory.shared : LLMModelFactory.shared
         self.logger = logger
 
